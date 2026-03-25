@@ -1,5 +1,4 @@
-name: Build Linux Heimdall 7.0-rc5
-
+name: "let's build"
 on:
   workflow_dispatch:
 
@@ -26,38 +25,91 @@ jobs:
         with:
           swap-size-gb: 8
 
+      - name: Generate build timestamp
+        id: timestamp
+        run: |
+          BUILD_DATE=$(date -u '+%Y-%m-%d')
+          BUILD_TIME=$(date -u '+%H%M%S')
+          BUILD_DATETIME="${BUILD_DATE}-${BUILD_TIME}"
+          echo "date=${BUILD_DATE}"         >> $GITHUB_OUTPUT
+          echo "time=${BUILD_TIME}"         >> $GITHUB_OUTPUT
+          echo "datetime=${BUILD_DATETIME}" >> $GITHUB_OUTPUT
+          echo "tag=heimdall-${BUILD_DATETIME}" >> $GITHUB_OUTPUT
+          echo "release_name=heimdall ${BUILD_DATE} ${BUILD_TIME}" >> $GITHUB_OUTPUT
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc libudev-dev libpci-dev libiberty-dev autoconf
-          
+          sudo apt-get install -y \
+            build-essential libncurses-dev bison flex \
+            libssl-dev libelf-dev bc libudev-dev libpci-dev \
+            libiberty-dev autoconf cpio kmod dracut
+
       - name: Clone linux-heimdall kernel source
         run: |
           git clone --depth 1 https://github.com/nc4tt/linux-heimdall.git kernel-source
-          cd kernel-source
 
       - name: Configure and Build
         working-directory: kernel-source
         run: |
           make mrproper
           make defconfig
-          # Using all available cores for speed
           make -j$(nproc)
+          make modules -j$(nproc)
 
-      - name: Extract Artifacts and Clean Source
+      - name: Install modules and generate initramfs
         run: |
           mkdir -p output
-          cp kernel-source/arch/x86/boot/bzImage output/
+          sudo make -C kernel-source modules_install INSTALL_MOD_PATH=$(pwd)/modules-staging
+          
+          KERNEL_VERSION=$(cat kernel-source/include/config/kernel.release 2>/dev/null \
+            || make -C kernel-source kernelrelease -s)
+          echo "KERNEL_VERSION=${KERNEL_VERSION}" >> $GITHUB_ENV
+          
+          cp kernel-source/arch/x86/boot/bzImage output/Image
           cp kernel-source/.config output/kernel.config
           
-          find kernel-source -name "*.ko" -exec cp {} output/ \; || true
-          
-          rm -rf kernel-source
-          echo "Cleanup complete. Source removed, artifacts preserved in ./output"
+          sudo dracut \
+            --force \
+            --kver "${KERNEL_VERSION}" \
+            --kmoddir "$(pwd)/modules-staging/lib/modules/${KERNEL_VERSION}" \
+            output/initramfs.img \
+            "${KERNEL_VERSION}" || \
+          mkinitramfs -o output/initramfs.img || \
+          echo "Warning: initramfs generation failed, skipping"
 
-      - name: Upload Build Result
+      - name: Bundle artifacts
+        run: |
+          cd output
+          sha256sum Image initramfs.img kernel.config > SHA256SUMS 2>/dev/null || \
+          sha256sum Image kernel.config > SHA256SUMS
+          ls -lh
+
+      - name: Upload Build Artifact (backup)
         uses: actions/upload-artifact@v4
         with:
-          name: heimdall-kernel-7.0-rc5
+          name: heimdall-kernel-7.0-rc5-${{ steps.timestamp.outputs.datetime }}
           path: output/
           retention-days: 5
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.timestamp.outputs.tag }}
+          name: ${{ steps.timestamp.outputs.release_name }}
+          body: ""
+          files: |
+            output/Image
+            output/initramfs.img
+            output/kernel.config
+            output/SHA256SUMS
+          draft: false
+          prerelease: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup source
+        run: |
+          rm -rf kernel-source modules-staging
+          echo "Done. Release: ${{ steps.timestamp.outputs.tag }}"
